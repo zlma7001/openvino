@@ -559,6 +559,16 @@ bool crop_in_place_optimization::match(const program_node& node,
         (!crop_node.get_dependency(1).is_constant() || !crop_node.get_dependency(2).is_constant()))
         return false;
 
+    // In-place crop on spatial axes causes stride mismatch in downstream
+    // kernels (e.g., eltwise) when feature > 1. Only allow in-place for
+    // feature-axis splits which have proper padding handling.
+    if (crop_node.get_primitive()->op_mode == cldnn::crop_ngraph_op_mode::variadic_split ||
+        crop_node.get_primitive()->op_mode == cldnn::crop_ngraph_op_mode::split) {
+        if (!can_crop_be_optimized_along_feature(crop_layout, input_layout)) {
+            return false;
+        }
+    }
+
     if (node.get_users().size() > 0) {
         GPU_DEBUG_IF(node.get_config().get_disable_runtime_buffer_fusing() && node.is_dynamic()) {
             return false;
