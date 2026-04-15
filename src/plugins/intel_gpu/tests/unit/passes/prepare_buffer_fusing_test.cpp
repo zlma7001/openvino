@@ -25,6 +25,7 @@
 #include "gather_inst.h"
 #include "strided_slice_inst.h"
 #include "mvn_inst.h"
+#include "rms_inst.h"
 #include "intel_gpu/graph/network.hpp"
 #include "pass_manager.h"
 #include "to_string_utils.h"
@@ -1994,4 +1995,128 @@ TEST(prepare_buffer_fusing, in_place_crop_dynamic_batch_axis_split_with_reshape_
         ASSERT_FLOAT_EQ(k_out[i], input_data[1 * slice_elems + i]) << "K mismatch at " << i;
     for (size_t i = 0; i < slice_elems; i++)
         ASSERT_FLOAT_EQ(v_out[i], input_data[2 * slice_elems + i]) << "V mismatch at " << i;
+}
+
+// Regression test for in-place crop on spatial axis followed by RMS normalization.
+// RMS kernels may not correctly handle spatial padding introduced by in-place crop.
+TEST(prepare_buffer_fusing, in_place_crop_rms_spatial_split) {
+    auto& engine = get_test_engine();
+
+    // Input [1,2,3,16] bfyx. VariadicSplit on axis 2 (spatial Y) into [2, 1].
+    // crop_0 covers y=[0..1] (size 2), crop_1 covers y=2 (size 1).
+    // Each crop feeds RMS normalization.
+    // dim_x = 16 is the minimum to trigger the optimized RMS kernel (bfyx_opt requires
+    // gamma logical size >= subgroup_size(16)). With smaller dim_x the ref kernel is
+    // selected instead, which handles padding correctly.
+    const int64_t dim_b = 1, dim_f = 2, dim_y = 3, dim_x = 16;
+    const int64_t split0 = 2, split1 = 1;
+    const int64_t off_y0 = 0, off_y1 = 2;
+    const float epsilon = 1e-6f;
+
+    auto in_layout = layout{ov::PartialShape{dim_b, dim_f, dim_y, dim_x},
+                            data_types::f32, format::bfyx};
+    auto input_mem = engine.allocate_memory({{dim_b, dim_f, dim_y, dim_x},
+                                             data_types::f32, format::bfyx});
+    auto axis_mem = engine.allocate_memory({{}, data_types::i64, format::bfyx});
+    auto splits_length_mem = engine.allocate_memory({{2}, data_types::i64, format::bfyx});
+    // Gamma weights for RMS: shape [1, 1, 1, dim_x] — per-element scale on X axis
+    auto gamma_mem = engine.allocate_memory({{1, 1, 1, dim_x}, data_types::f32, format::bfyx});
+
+    const int64_t axis = 2;
+    const size_t total = static_cast<size_t>(dim_b * dim_f * dim_y * dim_x);
+
+    // Deterministic input with small values
+    std::vector<float> input_data(total);
+    for (size_t i = 0; i < total; i++)
+        input_data[i] = static_cast<float>(i + 1);
+    set_values(input_mem, input_data);
+    set_values<int64_t>(axis_mem, {axis});
+    set_values<int64_t>(splits_length_mem, {split0, split1});
+    // Gamma = 1.0 (identity scale) for easy reference computation
+    std::vector<float> gamma_data(dim_x, 1.0f);
+    set_values(gamma_mem, gamma_data);
+
+    cldnn::crop_ngraph_op_mode op_mode = cldnn::crop_ngraph_op_mode::variadic_split;
+    auto offset_0 = cldnn::tensor(cldnn::batch(0), cldnn::feature(0), cldnn::spatial(0, off_y0));
+    auto offset_1 = cldnn::tensor(cldnn::batch(0), cldnn::feature(0), cldnn::spatial(0, off_y1));
+    topology topology(
+        input_layout("input", in_layout),
+        data("axis", axis_mem),
+        data("splits_length", splits_length_mem),
+        data("gamma", gamma_mem),
+        // Branch 0: crop [1,2,2,16] -> RMS normalization
+        crop("crop_0", {input_info("input"), input_info("axis"), input_info("splits_length")},
+             cldnn::tensor(1), offset_0, op_mode, 0, axis),
+        rms("rms_0", input_info("crop_0"), input_info("gamma"), epsilon),
+        reorder("output_0", input_info("rms_0"), format::bfyx, data_types::f32,
+                std::vector<float>(), reorder_mean_mode::subtract, padding(), true),
+        // Branch 1: crop [1,2,1,16] -> RMS normalization
+        crop("crop_1", {input_info("input"), input_info("axis"), input_info("splits_length")},
+             cldnn::tensor(1), offset_1, op_mode, 1, axis),
+        rms("rms_1", input_info("crop_1"), input_info("gamma"), epsilon),
+        reorder("output_1", input_info("rms_1"), format::bfyx, data_types::f32,
+                std::vector<float>(), reorder_mean_mode::subtract, padding(), true)
+    );
+
+    auto config = get_test_default_config(engine);
+    config.set_property(ov::intel_gpu::allow_new_shape_infer(true));
+    config.set_property(ov::intel_gpu::optimize_data(true));
+    network network(engine, topology, config);
+    network.set_input_data("input", input_mem);
+
+    auto outputs = network.execute();
+
+    ASSERT_TRUE(network.get_primitive("crop_0")->can_be_optimized());
+    ASSERT_TRUE(network.get_primitive("crop_1")->can_be_optimized());
+
+    // Reference: RMS norm with gamma=1.0
+    // rms_val = sqrt(mean(x^2) + epsilon)
+    // output[b,f,y,x] = input[b,f,y,x] / rms_val * gamma[x]
+    // With gamma=1: output = input / rms_val
+    auto compute_ref_rms = [&](int64_t f, int64_t y_in_src, int64_t num_x) {
+        double sum_sq = 0.0;
+        for (int64_t x = 0; x < num_x; x++) {
+            size_t idx = static_cast<size_t>(f * dim_y * dim_x + y_in_src * dim_x + x);
+            sum_sq += static_cast<double>(input_data[idx]) * input_data[idx];
+        }
+        double rms_val = std::sqrt(sum_sq / num_x + epsilon);
+        std::vector<float> ref(num_x);
+        for (int64_t x = 0; x < num_x; x++) {
+            size_t idx = static_cast<size_t>(f * dim_y * dim_x + y_in_src * dim_x + x);
+            ref[x] = static_cast<float>(input_data[idx] / rms_val);
+        }
+        return ref;
+    };
+
+    // Verify branch 0: crop [1,2,2,16], y-offset = 0
+    auto out0_mem = outputs.at("output_0").get_memory();
+    cldnn::mem_lock<float> out0(out0_mem, get_test_stream());
+    ASSERT_EQ(out0.size(), static_cast<size_t>(dim_b * dim_f * split0 * dim_x));
+
+    for (int64_t f = 0; f < dim_f; f++) {
+        for (int64_t y = 0; y < split0; y++) {
+            auto ref = compute_ref_rms(f, off_y0 + y, dim_x);
+            for (int64_t x = 0; x < dim_x; x++) {
+                size_t dst_idx = static_cast<size_t>(f * split0 * dim_x + y * dim_x + x);
+                ASSERT_NEAR(out0[dst_idx], ref[x], 1e-4f)
+                    << "Branch 0 mismatch at f=" << f << " y=" << y << " x=" << x;
+            }
+        }
+    }
+
+    // Verify branch 1: crop [1,2,1,16], y-offset = 2
+    auto out1_mem = outputs.at("output_1").get_memory();
+    cldnn::mem_lock<float> out1(out1_mem, get_test_stream());
+    ASSERT_EQ(out1.size(), static_cast<size_t>(dim_b * dim_f * split1 * dim_x));
+
+    for (int64_t f = 0; f < dim_f; f++) {
+        for (int64_t y = 0; y < split1; y++) {
+            auto ref = compute_ref_rms(f, off_y1 + y, dim_x);
+            for (int64_t x = 0; x < dim_x; x++) {
+                size_t dst_idx = static_cast<size_t>(f * split1 * dim_x + y * dim_x + x);
+                ASSERT_NEAR(out1[dst_idx], ref[x], 1e-4f)
+                    << "Branch 1 mismatch at f=" << f << " y=" << y << " x=" << x;
+            }
+        }
+    }
 }
